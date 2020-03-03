@@ -19,16 +19,12 @@ from __future__ import division
 from __future__ import print_function
 
 import collections
-import pandas as pd
-from tqdm import tqdm
 import os
 import modeling
 import optimization_finetuning as optimization
 import tokenization
 import tensorflow as tf
-from sklearn.metrics import *
-# from loss import bi_tempered_logistic_loss
-import json
+from attention_lstm import attention
 
 flags = tf.flags
 
@@ -87,7 +83,7 @@ flags.DEFINE_integer("predict_batch_size", 32, "Total batch size for predict.")
 
 flags.DEFINE_float("learning_rate", 5e-5, "The initial learning rate for Adam.")
 
-flags.DEFINE_float("num_train_epochs", 11.0,
+flags.DEFINE_float("num_train_epochs", 10.0,
                    "Total number of training epochs to perform.")
 
 flags.DEFINE_float(
@@ -95,7 +91,7 @@ flags.DEFINE_float(
     "Proportion of training to perform linear learning rate warmup for. "
     "E.g., 0.1 = 10% of training.")
 
-flags.DEFINE_integer("save_checkpoints_steps", 2000,
+flags.DEFINE_integer("save_checkpoints_steps", 1000,
                      "How often to save the model checkpoint.")
 
 flags.DEFINE_integer("iterations_per_loop", 1000,
@@ -463,15 +459,15 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
     output_bias = tf.get_variable(
         "output_bias", [num_labels], initializer=tf.zeros_initializer())
 
-
     state_size = 128  # hidden layer num of features
+    ATTENTION_SIZE = 50
 
     # 双向rnn
-    lstm_fw_cell = tf.contrib.rnn.BasicLSTMCell(state_size)
-    lstm_fw_cell = tf.contrib.rnn.DropoutWrapper(lstm_fw_cell, output_keep_prob=0.8)
+    gru_fw_cell = tf.contrib.rnn.GRUCell(state_size)
+    gru_fw_cell = tf.contrib.rnn.DropoutWrapper(gru_fw_cell, output_keep_prob=0.8)
 
-    lstm_bw_cell = tf.contrib.rnn.BasicLSTMCell(state_size)
-    lstm_bw_cell = tf.contrib.rnn.DropoutWrapper(lstm_bw_cell, output_keep_prob=0.8)
+    gru_bw_cell = tf.contrib.rnn.GRUCell(state_size)
+    gru_bw_cell = tf.contrib.rnn.DropoutWrapper(gru_bw_cell, output_keep_prob=0.8)
 
     if mode == tf.estimator.ModeKeys.TRAIN:
         batch_sizes = FLAGS.train_batch_size
@@ -479,12 +475,13 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
         batch_sizes = FLAGS.eval_batch_size
     else:
         batch_sizes = FLAGS.predict_batch_size
-    init_fw = lstm_fw_cell.zero_state(batch_sizes, dtype=tf.float32)
-    init_bw = lstm_bw_cell.zero_state(batch_sizes, dtype=tf.float32)
-    weights = tf.get_variable("weights", [2 * state_size, num_labels], dtype=tf.float32,  # 注意这里的维度
-                              initializer=tf.random_normal_initializer(mean=0, stddev=1))
-    biases = tf.get_variable("biases", [num_labels], dtype=tf.float32,
-                             initializer=tf.random_normal_initializer(mean=0, stddev=1))
+    init_fw = gru_fw_cell.zero_state(batch_sizes, dtype=tf.float32)
+    init_bw = gru_bw_cell.zero_state(batch_sizes, dtype=tf.float32)
+
+    # weights = tf.get_variable("weights", [2 * state_size, num_labels], dtype=tf.float32,  # 注意这里的维度
+    #                           initializer=tf.random_normal_initializer(mean=0, stddev=1))
+    # biases = tf.get_variable("biases", [num_labels], dtype=tf.float32,
+    #                          initializer=tf.random_normal_initializer(mean=0, stddev=1))
 
     ln_type = bert_config.ln_type
     all_predict = []
@@ -503,20 +500,24 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
         init_state = tf.squeeze(current_output[:, 0:1, :], axis=1)
         # init_state = tf.transpose(init_state,perm=[1,0])
         # init_state = tf.expand_dims(init_state,axis=1)
-        outputs, final_states = tf.nn.bidirectional_dynamic_rnn(lstm_fw_cell,
-                                                                lstm_bw_cell,
+        outputs, final_states = tf.nn.bidirectional_dynamic_rnn(gru_fw_cell,
+                                                                gru_bw_cell,
                                                                 current_output_seq,
                                                                 initial_state_fw=init_bw,
                                                                 initial_state_bw=init_fw,
                                                                 time_major=False)
 
-        outputs = tf.reshape(outputs, shape=[-1, (FLAGS.max_seq_length-1),state_size*2])  # [2 * batch_size, seq_length, cell.output_size]
-        outputs = tf.transpose(outputs, perm=[1, 0, 2])  # [seq_length, batch_size，output_size]
-        outputs = tf.reduce_max(outputs, 0)  # [batch_size，output_size]
-        single_pre = tf.layers.dense(outputs, num_labels)
+        attention_output, alphas = attention(outputs, ATTENTION_SIZE, return_alphas=True,reused=tf.AUTO_REUSE)
 
+        drop = tf.nn.dropout(attention_output, 0.8)
 
-        #第一次实验
+        # outputs = tf.reshape(outputs, shape=[-1, (FLAGS.max_seq_length - 1),
+        #                                      state_size * 2])  # [2 * batch_size, seq_length, cell.output_size]
+        # outputs = tf.transpose(outputs, perm=[1, 0, 2])  # [seq_length, batch_size，output_size]
+        # outputs = tf.reduce_max(outputs, 0)  # [batch_size，output_size]
+        single_pre = tf.layers.dense(drop, num_labels)
+
+        # 第一次实验
         # c_state = final_states[0][0] + final_states[1][0]
         # h_state = final_states[0][1] + final_states[1][1]
         # # c_state = final_states[0][0]
@@ -535,7 +536,7 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
         logits_bert = tf.matmul(output_layer_bert, output_weights, transpose_b=True)
         logits_bert = tf.nn.bias_add(logits_bert, output_bias)
 
-        logits=(logits+logits_bert)/2.0
+        logits = (logits + logits_bert) / 2.0
 
         probabilities = tf.nn.softmax(logits, axis=-1)
         log_probs = tf.nn.log_softmax(logits, axis=-1)
@@ -911,6 +912,7 @@ def main(_):
         master=FLAGS.master,
         model_dir=FLAGS.output_dir,
         save_checkpoints_steps=FLAGS.save_checkpoints_steps,
+        keep_checkpoint_max=15,
         tpu_config=tf.contrib.tpu.TPUConfig(
             iterations_per_loop=FLAGS.iterations_per_loop,
             num_shards=FLAGS.num_tpu_cores,

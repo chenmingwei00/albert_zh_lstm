@@ -24,6 +24,7 @@ import modeling
 import optimization_finetuning as optimization
 import tokenization
 import tensorflow as tf
+from attention_lstm import attention
 
 flags = tf.flags
 
@@ -447,18 +448,19 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
     # 这个获取句子的output 利用的是albert中的
     output_layer = model.get_final_label()
 
-    # output_layer_bert = model.get_pooled_output()
-    #
-    # hidden_size = output_layer_bert.shape[-1].value
+    output_layer_bert = model.get_pooled_output()
 
-    # output_weights = tf.get_variable(
-    #     "output_weights", [num_labels, hidden_size],
-    #     initializer=tf.truncated_normal_initializer(stddev=0.02))
-    #
-    # output_bias = tf.get_variable(
-    #     "output_bias", [num_labels], initializer=tf.zeros_initializer())
+    hidden_size = output_layer_bert.shape[-1].value
 
-    state_size = 256  # hidden layer num of features
+    output_weights = tf.get_variable(
+        "output_weights", [num_labels, hidden_size],
+        initializer=tf.truncated_normal_initializer(stddev=0.02))
+
+    output_bias = tf.get_variable(
+        "output_bias", [num_labels], initializer=tf.zeros_initializer())
+
+    state_size = 128  # hidden layer num of features
+    ATTENTION_SIZE = 50
 
     # 双向rnn
     gru_fw_cell = tf.contrib.rnn.GRUCell(state_size)
@@ -505,11 +507,15 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
                                                                 initial_state_bw=init_fw,
                                                                 time_major=False)
 
-        outputs = tf.reshape(outputs, shape=[-1, (FLAGS.max_seq_length - 1),
-                                             state_size * 2])  # [2 * batch_size, seq_length, cell.output_size]
-        outputs = tf.transpose(outputs, perm=[1, 0, 2])  # [seq_length, batch_size，output_size]
-        outputs = tf.reduce_max(outputs, 0)  # [batch_size，output_size]
-        single_pre = tf.layers.dense(outputs, num_labels)
+        attention_output, alphas = attention(outputs, ATTENTION_SIZE, return_alphas=True,reused=tf.AUTO_REUSE)
+
+        drop = tf.nn.dropout(attention_output, 0.8)
+
+        # outputs = tf.reshape(outputs, shape=[-1, (FLAGS.max_seq_length - 1),
+        #                                      state_size * 2])  # [2 * batch_size, seq_length, cell.output_size]
+        # outputs = tf.transpose(outputs, perm=[1, 0, 2])  # [seq_length, batch_size，output_size]
+        # outputs = tf.reduce_max(outputs, 0)  # [batch_size，output_size]
+        single_pre = tf.layers.dense(drop, num_labels)
 
         # 第一次实验
         # c_state = final_states[0][0] + final_states[1][0]
@@ -527,10 +533,10 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
         logits = tf.layers.dense(inputs=all_predict, units=1, activation=None)
         logits = tf.squeeze(logits, axis=-1)
 
-        # logits_bert = tf.matmul(output_layer_bert, output_weights, transpose_b=True)
-        # logits_bert = tf.nn.bias_add(logits_bert, output_bias)
+        logits_bert = tf.matmul(output_layer_bert, output_weights, transpose_b=True)
+        logits_bert = tf.nn.bias_add(logits_bert, output_bias)
 
-        # logits = (logits + logits_bert) / 2.0
+        logits = (logits + logits_bert) / 2.0
 
         probabilities = tf.nn.softmax(logits, axis=-1)
         log_probs = tf.nn.log_softmax(logits, axis=-1)
@@ -906,7 +912,7 @@ def main(_):
         master=FLAGS.master,
         model_dir=FLAGS.output_dir,
         save_checkpoints_steps=FLAGS.save_checkpoints_steps,
-        keep_checkpoint_max=11,
+        keep_checkpoint_max=15,
         tpu_config=tf.contrib.tpu.TPUConfig(
             iterations_per_loop=FLAGS.iterations_per_loop,
             num_shards=FLAGS.num_tpu_cores,
